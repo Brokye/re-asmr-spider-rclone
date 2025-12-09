@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"path/filepath"
 
 	"re-asmr-spider/config"
 	"re-asmr-spider/i18n"
@@ -17,6 +18,42 @@ import (
 )
 
 var Conf *config.Config
+const LocalTempDir = "/root/asmr_temp"
+func moveFile(src, dst string) error {
+	// 尝试直接重命名（如果是在同一个分区可能成功，但挂载点通常不行）
+	err := os.Rename(src, dst)
+	if err == nil {
+		return nil
+	}
+
+	// 如果重命名失败（跨设备移动），则进行 复制+删除
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	// 确保目标目录存在
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	_, err = io.Copy(destFile, sourceFile)
+	if err != nil {
+		return err
+	}
+
+	// 复制成功后，关闭文件并删除源文件
+	sourceFile.Close()
+	destFile.Close()
+	return os.Remove(src)
+}
 
 func init() {
 	var err error
@@ -209,33 +246,35 @@ func (ac *ASMRClient) DownloadFile(url string, dirPath string, fileName string) 
 	ac.downloadFileInternal(url, dirPath, fileName, 0)
 }
 
+// 修改 downloadFileInternal 方法
 func (ac *ASMRClient) downloadFileInternal(url string, dirPath string, fileName string, retryCount int) {
 	if runtime.GOOS == "windows" {
 		for _, str := range []string{"?", "<", ">", ":", "/", "\\", "*", "|"} {
 			fileName = strings.Replace(fileName, str, "_", -1)
 		}
 	}
-	savePath := dirPath + "/" + fileName
+	
+	// 最终保存路径 (Rclone 挂载路径)
+	finalSavePath := dirPath + "/" + fileName
+
+	// 1. 检查最终目标是否存在 (逻辑不变)
 	headers := map[string]string{
 		"Referer": "https://www.asmr.one/",
 	}
 
-	if utils.PathExists(savePath) {
-		// 获取本地文件大小
-		localSize, err := utils.GetFileSize(savePath)
+	if utils.PathExists(finalSavePath) {
+		localSize, err := utils.GetFileSize(finalSavePath)
 		if err != nil {
 			utils.Warning(i18n.T("file_error", err))
 		} else {
-			// 获取远程文件大小
 			remoteSize, err := utils.GetRemoteFileSize(url, headers)
 			if err != nil {
 				utils.Warning(i18n.T("network_error", err))
-				utils.Info(i18n.T("file_exists", savePath))
+				utils.Info(i18n.T("file_exists", finalSavePath))
 				return
 			}
-
 			if localSize == remoteSize {
-				utils.Info(i18n.T("file_exists", savePath))
+				utils.Info(i18n.T("file_exists", finalSavePath))
 				return
 			} else {
 				utils.Warning(i18n.T("file_error", fmt.Sprintf("size mismatch: local=%d, remote=%d", localSize, remoteSize)))
@@ -243,11 +282,50 @@ func (ac *ASMRClient) downloadFileInternal(url string, dirPath string, fileName 
 		}
 	}
 
-	downloader := utils.NewDownloader(url, dirPath, fileName, ac.ThreadCount, headers)
-	downloader.RetryCount = retryCount
-	downloader.OnFailure = func(failedUrl, failedPath, failedName string, err error) {
-		ac.AddFailedTask(failedUrl, failedPath, failedName, retryCount)
+	// 2. 构造本地临时路径
+	// 保持目录结构，避免文件名冲突
+	// 例如: /root/asmr_temp/RJ123456/sound.wav
+	relDir := strings.TrimPrefix(dirPath, "downloads/") // 假设 base 是 downloads
+	tempDir := filepath.Join(LocalTempDir, relDir)
+	_ = os.MkdirAll(tempDir, 0755)
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		utils.Error("Failed to create temp dir: %v", err)
+		return 
 	}
+	
+	// 临时文件全路径
+	tempFullPath := filepath.Join(tempDir, fileName)
+
+	// 3. 修改 Downloader 初始化，下载到 tempFullPath
+	// 注意：这里传入 tempDir 和 fileName
+	downloader := utils.NewDownloader(url, tempDir, fileName, ac.ThreadCount, headers)
+	downloader.FinalPath = finalSavePath
+	downloader.RetryCount = retryCount
+	
+	// 这里需要拦截 Downloader 的 OnFailure，如果下载失败不移动
+	originalFailure := downloader.OnFailure
+	downloader.OnFailure = func(failedUrl, failedPath, failedName string, err error) {
+		// 失败时，删除临时文件
+		os.Remove(tempFullPath)
+		if ac.FailedTasks != nil { // 确保 ac.AddFailedTask 可用
+             ac.AddFailedTask(failedUrl, dirPath, failedName, retryCount) // 注意这里存回原始 dirPath
+        }
+        // 调用原始逻辑（如果有）
+        if originalFailure != nil {
+            originalFailure(failedUrl, failedPath, failedName, err)
+        }
+	}
+
+	// 我们需要包装一下 TaskQueue 的处理逻辑，
+    // 因为 Downloader 是在 WorkerPool 里异步执行的，
+    // 我们无法直接在这里写 moveFile。
+    
+    // **最佳修改方案**：
+    // 不改 WorkerPool，而是利用 Downloader 成功后的回调机制。
+    // 但是现在的 Downloader 没有 Success 回调。
+    // 我们可以在 downloader.go 中增加 OnSuccess，或者简单一点：
+    // 修改 worker.go 的逻辑（见下文）。
+    
 	ac.WorkerPool.TaskQueue <- downloader
 }
 
