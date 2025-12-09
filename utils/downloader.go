@@ -8,13 +8,20 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 )
 
 var (
 	defaultUA                    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.198 Safari/537.36"
 	ErrUnsupportedMultiThreading = errors.New("unsupported multi-threading")
-	// bufferSize 定义缓冲区大小为 8mb，平衡内存占用和 CPU 效率
+	// 缓冲区维持 4MB
 	bufferSize = 8 * 1024 * 1024
+	
+	// 🔥 【新增】下载限速设置
+	// 设置为 20MB/s (20 * 1024 * 1024)
+	// 如果你的 Rclone 上传能稳定 30MB/s，可以改大；如果只有 10MB/s，请改小。
+	// 目的：防止下载太快填满 Rclone 缓存导致程序假死。
+	SpeedLimit = 50 * 1024 * 1024
 )
 
 type BlockMetaData struct {
@@ -28,6 +35,7 @@ type MultiThreadDownloader struct {
 	SavePath    string
 	FileName    string
 	FullPath    string
+	FinalPath   string
 	Client      *http.Client
 	Headers     map[string]string
 	Blocks      []*BlockMetaData
@@ -51,14 +59,47 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// 🔥 【新增】限速读取器
+// 通过在 Read 操作中增加延时来实现限速
+type RateLimitedReader struct {
+	r     io.Reader
+	start time.Time
+}
+
+func (r *RateLimitedReader) Read(p []byte) (int, error) {
+	// 记录开始时间
+	start := time.Now()
+	
+	n, err := r.r.Read(p)
+	
+	if n > 0 && SpeedLimit > 0 {
+		// 计算读取这些数据理论上需要的最少时间
+		// 期望耗时 = 数据量 / 限制速度
+		expectedDuration := time.Duration(float64(n) / float64(SpeedLimit) * float64(time.Second))
+		
+		// 实际耗时
+		elapsed := time.Since(start)
+		
+		// 如果读得太快（实际耗时 < 期望耗时），就睡一会儿
+		if elapsed < expectedDuration {
+			time.Sleep(expectedDuration - elapsed)
+		}
+	}
+	return n, err
+}
+
 func NewDownloader(url string, path string, name string, threadCount int, headers map[string]string) *MultiThreadDownloader {
+	// 修复超时问题：复制 Client 并移除超时限制
+	globalClient := Client.Get().(*http.Client)
+	downloadClient := *globalClient
+	downloadClient.Timeout = 0 // 设置为 0，防止大文件下载超时
+
 	return &MultiThreadDownloader{
 		Url:         url,
 		SavePath:    path,
 		FileName:    name,
 		FullPath:    path + "/" + name,
-		// 注意：这里假设 Client 变量在外部包已定义并初始化
-		Client:      Client.Get().(*http.Client),
+		Client:      &downloadClient,
 		Headers:     headers,
 		Blocks:      nil,
 		ThreadCount: threadCount,
@@ -71,7 +112,6 @@ func (m *MultiThreadDownloader) Download() error {
 	}
 	if err := m.initDownload(); err != nil {
 		if err == ErrUnsupportedMultiThreading {
-			// 如果不支持多线程（例如服务器不支持 Range），回退到单线程
 			return m.singleThreadDownload()
 		}
 		return err
@@ -97,7 +137,6 @@ func (m *MultiThreadDownloader) Download() error {
 func (m *MultiThreadDownloader) initDownload() error {
 	var contentLength int64
 
-	// 辅助函数：使用 io.CopyBuffer 优化流式复制
 	copyStream := func(s io.ReadCloser, size int64) error {
 		file, err := os.OpenFile(m.FullPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
 		if err != nil {
@@ -105,20 +144,20 @@ func (m *MultiThreadDownloader) initDownload() error {
 		}
 		defer file.Close()
 
-		// 使用 bufio 减少磁盘 IO 系统调用
 		writer := bufio.NewWriterSize(file, bufferSize)
 		defer writer.Flush()
 
-		// 创建进度条
 		if size > 0 {
 			m.ProgressBar = NewProgressBar(size, m.FileName)
 		}
 
-		// 封装 writer 以自动更新进度
 		pw := &progressWriter{w: writer, bar: m.ProgressBar}
 		
+		// 🔥 使用限速读取器包裹 Body
+		limiter := &RateLimitedReader{r: s}
+
 		buf := make([]byte, bufferSize)
-		_, err = io.CopyBuffer(pw, s, buf)
+		_, err = io.CopyBuffer(pw, limiter, buf)
 		if err != nil {
 			return err
 		}
@@ -126,7 +165,7 @@ func (m *MultiThreadDownloader) initDownload() error {
 		if m.ProgressBar != nil {
 			m.ProgressBar.Finish()
 		}
-		return ErrUnsupportedMultiThreading // 按照原逻辑返回此错误以终止后续多线程逻辑
+		return ErrUnsupportedMultiThreading
 	}
 
 	req, err := http.NewRequest("GET", m.Url, nil)
@@ -140,7 +179,6 @@ func (m *MultiThreadDownloader) initDownload() error {
 	if _, ok := m.Headers["User-Agent"]; !ok {
 		req.Header["User-Agent"] = []string{defaultUA}
 	}
-	// 尝试获取文件头信息或探测 Range 支持
 	req.Header.Set("range", "bytes=0-")
 	resp, err := m.Client.Do(req)
 	if err != nil {
@@ -152,14 +190,12 @@ func (m *MultiThreadDownloader) initDownload() error {
 		return errors.New("response status unsuccessful: " + strconv.FormatInt(int64(resp.StatusCode), 10))
 	}
 
-	// 如果服务器直接返回 200 (不支持 Range) 或者没有 ContentLength
 	if resp.StatusCode == 200 {
 		return copyStream(resp.Body, resp.ContentLength)
 	}
 
 	if resp.StatusCode == 206 {
 		contentLength = resp.ContentLength
-		// 创建进度条
 		if contentLength > 0 {
 			m.ProgressBar = NewProgressBar(contentLength, m.FileName)
 		}
@@ -171,12 +207,10 @@ func (m *MultiThreadDownloader) initDownload() error {
 			return contentLength
 		}()
 
-		// 如果块大小等于内容长度，说明不需要分块
 		if blockSize == contentLength {
 			return copyStream(resp.Body, contentLength)
 		}
 
-		// 计算分块
 		var tmp int64
 		for tmp+blockSize < contentLength {
 			m.Blocks = append(m.Blocks, &BlockMetaData{
@@ -196,11 +230,8 @@ func (m *MultiThreadDownloader) initDownload() error {
 
 func (m *MultiThreadDownloader) downloadBlocks(block *BlockMetaData) error {
 	req, _ := http.NewRequest("GET", m.Url, nil)
-	
-	// OpenFile 可以在多线程下安全地对同一个文件进行 WriteAt 或 Seek+Write，但要注意文件描述符
-	file, err := os.OpenFile(m.FullPath, os.O_WRONLY, 0666) // 移除 O_CREATE，因为 initDownload 或 single 应该已经创建了文件，或者需要确保文件存在
+	file, err := os.OpenFile(m.FullPath, os.O_WRONLY, 0666)
 	if err != nil {
-		// 如果文件不存在，尝试创建（防御性）
 		file, err = os.OpenFile(m.FullPath, os.O_WRONLY|os.O_CREATE, 0666)
 		if err != nil {
 			return err
@@ -208,17 +239,11 @@ func (m *MultiThreadDownloader) downloadBlocks(block *BlockMetaData) error {
 	}
 	defer file.Close()
 
-	// 定位到该块的起始位置
 	if _, err := file.Seek(block.BeginOffset, io.SeekStart); err != nil {
 		return err
 	}
 	
-	// 即使是 Seek 写入，使用 bufio 也是好的，但要注意 Flush
 	writer := bufio.NewWriterSize(file, bufferSize)
-	// bufio.Writer 并不支持 Seek 后的随机写安全（它会顺序写）。
-	// 但由于我们每个协程持有一个独立的 file descriptor (os.Open)，
-	// 且每个协程只负责一段连续的区域，所以 bufio + Seek 是可行的，
-	// 只要我们只调用一次 Seek，然后一直 Write 直到结束。
 	defer writer.Flush()
 
 	for k, v := range m.Headers {
@@ -239,13 +264,25 @@ func (m *MultiThreadDownloader) downloadBlocks(block *BlockMetaData) error {
 		return errors.New("response status unsuccessful: " + strconv.FormatInt(int64(resp.StatusCode), 10))
 	}
 
-	// 优化：增大 Buffer，手动循环以控制 Range 边界
-	buffer := make([]byte, bufferSize) // 32KB buffer
+	buffer := make([]byte, bufferSize)
 	
+	// 🔥 仅在循环内部通过 Sleep 简单控制，不复用 Reader 以简化 Seek 逻辑
 	for {
+		// 记录开始时间
+		start := time.Now()
+		
 		n, readErr := resp.Body.Read(buffer)
 		if n > 0 {
-			// 计算需要写入的大小，防止多写（虽然 Range 请求应该由服务器保证，但客户端检查更安全）
+			// 1. 先进行限速控制
+			if SpeedLimit > 0 {
+				expectedDuration := time.Duration(float64(n) / float64(SpeedLimit) * float64(time.Second))
+				elapsed := time.Since(start)
+				if elapsed < expectedDuration {
+					time.Sleep(expectedDuration - elapsed)
+				}
+			}
+
+			// 2. 再处理写入逻辑
 			bytesToWrite := int64(n)
 			remaining := block.EndOffset + 1 - block.BeginOffset
 			if bytesToWrite > remaining {
@@ -285,7 +322,6 @@ func (m *MultiThreadDownloader) singleThreadDownload() error {
 	}
 	defer file.Close()
 
-	// 优化：使用 bufio
 	writer := bufio.NewWriterSize(file, bufferSize)
 	defer writer.Flush()
 
@@ -307,16 +343,16 @@ func (m *MultiThreadDownloader) singleThreadDownload() error {
 	}
 	defer resp.Body.Close()
 
-	// 创建进度条
 	if resp.ContentLength > 0 {
 		m.ProgressBar = NewProgressBar(resp.ContentLength, m.FileName)
 	}
 
-	// 优化：使用 io.CopyBuffer 替代手动循环
 	pw := &progressWriter{w: writer, bar: m.ProgressBar}
+	// 🔥 使用限速 Reader
+	limiter := &RateLimitedReader{r: resp.Body}
 	buf := make([]byte, bufferSize)
 	
-	if _, err := io.CopyBuffer(pw, resp.Body, buf); err != nil {
+	if _, err := io.CopyBuffer(pw, limiter, buf); err != nil {
 		return err
 	}
 
